@@ -59,6 +59,7 @@
 ##############################################################################
 
 import os
+import time
 # import logging
 # logger = logging.getLogger("zc.lockfile")
 
@@ -119,7 +120,14 @@ class LockFile:
         self._path = path
         set_permissions = file_permissions and not os.path.exists(path)
         try:
-            fp = open(path, 'w+')
+            for attempt in range(10):
+                try:
+                    fp = open(path, 'w+')
+                    break
+                except IOError:
+                    if attempt == 9:  # Last attempt
+                        raise
+                    time.sleep(0.1)  # Wait 100ms between attempts
         except IOError:
             raise Exception('Could not create Lock-file, wrong permissions on lock directory?')
 
