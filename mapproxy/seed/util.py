@@ -21,6 +21,7 @@ import stat
 import math
 import time
 from datetime import datetime
+import traceback
 
 try:
     import cPickle as pickle
@@ -206,6 +207,7 @@ def exp_backoff(func, args=(), kw={}, max_repeat=10, start_backoff_sec=2,
             wait_for = start_backoff_sec * 2**n
             if wait_for > max_backoff:
                 wait_for = max_backoff
+            traceback.print_exc()
             print("An error occured. Retry in %d seconds: %r. Retries left: %d" %
                   (wait_for, ex, (max_repeat - n)), file=sys.stderr)
             time.sleep(wait_for)
