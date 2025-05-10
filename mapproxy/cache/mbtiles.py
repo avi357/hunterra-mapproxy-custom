@@ -65,6 +65,17 @@ class MBTilesCache(TileCacheBase):
         if not getattr(self._db_conn_cache, 'db', None):
             self.ensure_mbtile()
             self._db_conn_cache.db = sqlite3.connect(self.mbtile_file, self.timeout)
+            for attempt in range(100):
+                try:
+                    if self.wal:
+                        self._db_conn_cache.db.execute('PRAGMA journal_mode=wal')
+                    else:
+                        self._db_conn_cache.db.execute('PRAGMA journal_mode=DELETE')
+                    break
+                except sqlite3.OperationalError:
+                    if attempt == 99:
+                        raise
+                    time.sleep(0.1)
         return self._db_conn_cache.db
 
     def cleanup(self):
@@ -85,10 +96,6 @@ class MBTilesCache(TileCacheBase):
 
     def _initialize_mbtile(self):
         log.info('initializing MBTile file %s', self.mbtile_file)
-        with sqlite3.connect(self.mbtile_file) as db:
-            if self.wal:
-                db.execute('PRAGMA journal_mode=wal')
-
             stmt = """
                 CREATE TABLE tiles (
                     zoom_level integer,

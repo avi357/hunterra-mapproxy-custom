@@ -571,6 +571,10 @@
           "description": "Enables bulk loading of meta tiles",
           "type": "boolean"
         },
+        "sqlite_wal": {
+          "description": "Enables SQLite WAL mode",
+          "type": "boolean"
+        },
         "image": {
           "title": "image",
           "description": "Image options",
