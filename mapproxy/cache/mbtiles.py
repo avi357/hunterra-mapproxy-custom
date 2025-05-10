@@ -18,6 +18,7 @@ import hashlib
 import os
 import random
 import threading
+import contextlib
 import time
 from io import BytesIO
 from itertools import groupby
@@ -64,7 +65,7 @@ class MBTilesCache(TileCacheBase):
     def db(self):
         if not getattr(self._db_conn_cache, 'db', None):
             self.ensure_mbtile()
-            self._db_conn_cache.db = sqlite3.connect(self.mbtile_file, self.timeout)
+            self._db_conn_cache.db = sqlite3.connect(self.mbtile_file, timeout=self.timeout)
             for attempt in range(100):
                 try:
                     if self.wal:
@@ -98,6 +99,7 @@ class MBTilesCache(TileCacheBase):
 
     def _initialize_mbtile(self):
         log.info('initializing MBTile file %s', self.mbtile_file)
+        with sqlite3.connect(self.mbtile_file, timeout=self.timeout) as db:
             stmt = """
                 CREATE TABLE tiles (
                     zoom_level integer,
@@ -128,6 +130,18 @@ class MBTilesCache(TileCacheBase):
             permission = int(self.file_permissions, base=8)
             log.info("setting file permissions on MBTile file: ", permission)
             os.chmod(self.mbtile_file, permission)
+
+    def _retry_db(self, body):
+        error = None
+
+        for _ in range(100):
+            try:
+                return body()
+            except sqlite3.OperationalError as ex:
+                error = ex
+                time.sleep(0.1)
+
+        raise error
 
     def update_metadata(self, name='', description='', version=1, overlay=True, format='png'):
         self.db.execute("""
@@ -184,51 +198,59 @@ class MBTilesCache(TileCacheBase):
                 else:
                     records.append((level, x, y, content))
 
-        cursor = self.db.cursor()
         try:
-            if self.supports_timestamp:
-                stmt = ("INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data, last_modified)"
-                        " VALUES (?,?,?,?, datetime(?, 'unixepoch', 'localtime'))")
-                cursor.executemany(stmt, records)
-            else:
-                stmt = "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)"
-                cursor.executemany(stmt, records)
-            self.db.commit()
+            with contextlib.closing(self.db.cursor()) as cursor:
+                def execute():
+                    if self.supports_timestamp:
+                        stmt = ("INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data, last_modified)"
+                                " VALUES (?,?,?,?, datetime(?, 'unixepoch', 'localtime'))")
+                        cursor.executemany(stmt, records)
+                    else:
+                        stmt = "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)"
+                        cursor.executemany(stmt, records)
+                    return self.db.commit()
+                self._retry_db(execute)
         except sqlite3.OperationalError as ex:
             log.warning('unable to store tile: %s', ex)
             return False
+
         return True
 
     def load_tile(self, tile, with_metadata=False, dimensions=None):
         if tile.source or tile.coord is None:
             return True
 
-        cur = self.db.cursor()
-        if self.supports_timestamp:
-            stmt = '''SELECT tile_data, last_modified
-                FROM tiles
-                WHERE tile_column = ? AND
-                      tile_row = ? AND
-                      zoom_level = ?'''
-        else:
-            stmt = '''SELECT tile_data FROM tiles
-                WHERE tile_column = ? AND
-                      tile_row = ? AND
-                      zoom_level = ?'''
+        with contextlib.closing(self.db.cursor()) as cur:
+            def execute():
+                if self.supports_timestamp:
+                    stmt = '''SELECT tile_data, last_modified
+                        FROM tiles
+                        WHERE tile_column = ? AND
+                              tile_row = ? AND
+                              zoom_level = ?'''
+                else:
+                    stmt = '''SELECT tile_data FROM tiles
+                        WHERE tile_column = ? AND
+                              tile_row = ? AND
+                              zoom_level = ?'''
 
-        if self.ttl:
-            stmt += " AND datetime('now', 'localtime', '%d seconds') < last_modified" % -self.ttl
+                if self.ttl:
+                    stmt += " AND datetime('now', 'localtime', '%d seconds') < last_modified" % -self.ttl
 
-        cur.execute(stmt, tile.coord)
+                cur.execute(stmt, tile.coord)
 
-        content = cur.fetchone()
-        if content:
-            tile.source = ImageSource(BytesIO(content[0]))
-            if self.supports_timestamp:
-                tile.timestamp = sqlite_datetime_to_timestamp(content[1])
-            return True
-        else:
-            return False
+                content = cur.fetchone()
+
+                if content:
+                    tile.source = ImageSource(BytesIO(content[0]))
+                    if self.supports_timestamp:
+                        tile.timestamp = sqlite_datetime_to_timestamp(content[1])
+                    return True
+                else:
+                    return False
+
+            return self._retry_db(execute)
+        return False
 
     def load_tiles(self, tiles, with_metadata=False, dimensions=None):
         # associate the right tiles with the cursor
@@ -264,53 +286,68 @@ class MBTilesCache(TileCacheBase):
             stmt = stmt_base + '(' + ' OR '.join(
                 ['(tile_column = ? AND tile_row = ? AND zoom_level = ?)'] * (len(cur_coords) // 3)) + ')'
 
-            cursor = self.db.cursor()
-            cursor.execute(stmt, cur_coords)
+            with contextlib.closing(self.db.cursor()) as cursor:
+                def execute():
+                    cursor.execute(stmt, cur_coords)
 
-            for row in cursor:
-                loaded_tiles += 1
-                tile = tile_dict[(row[0], row[1])]
-                data = row[2]
-                tile.size = len(data)
-                tile.source = ImageSource(BytesIO(data))
-                if self.supports_timestamp:
-                    tile.timestamp = sqlite_datetime_to_timestamp(row[3])
-            cursor.close()
+                    local_loaded_tiles = 0
+
+                    for row in cursor:
+                        local_loaded_tiles += 1
+                        tile = tile_dict[(row[0], row[1])]
+                        data = row[2]
+                        tile.size = len(data)
+                        tile.source = ImageSource(BytesIO(data))
+                        if self.supports_timestamp:
+                            tile.timestamp = sqlite_datetime_to_timestamp(row[3])
+
+                    return local_loaded_tiles
+
+                loaded_tiles += self._retry_db(execute)
 
             coords = coords[999:]
 
         return loaded_tiles == len(tile_dict)
 
     def remove_tile(self, tile, dimensions=None):
-        cursor = self.db.cursor()
-        cursor.execute(
-            "DELETE FROM tiles WHERE (tile_column = ? AND tile_row = ? AND zoom_level = ?)",
-            tile.coord)
-        self.db.commit()
-        if cursor.rowcount:
-            return True
+        with contextlib.closing(self.db.cursor()) as cursor:
+            def execute():
+                cursor.execute(
+                    "DELETE FROM tiles WHERE (tile_column = ? AND tile_row = ? AND zoom_level = ?)",
+                    tile.coord)
+                self.db.commit()
+                if cursor.rowcount:
+                    return True
+                return False
+            return self._retry_db(execute)
         return False
 
     def remove_level_tiles_before(self, level, timestamp=None, remove_all=False):
         if remove_all:
-            cursor = self.db.cursor()
-            cursor.execute(
-                "DELETE FROM tiles WHERE (zoom_level = ?)",
-                (level, ))
-            self.db.commit()
-            if cursor.rowcount:
-                return True
-            return False
+            with contextlib.closing(self.db.cursor()) as cursor:
+                def execute():
+                    self._open_transaction(cursor)
+                    cursor.execute(
+                        "DELETE FROM tiles WHERE (zoom_level = ?)",
+                        (level, ))
+                    self.db.commit()
+                    if cursor.rowcount:
+                        return True
+                    return False
+                return self._retry_db(execute)
 
         if self.supports_timestamp:
-            cursor = self.db.cursor()
-            cursor.execute(
-                "DELETE FROM tiles WHERE (zoom_level = ? AND last_modified < datetime(?, 'unixepoch', 'localtime'))",
-                (level, timestamp))
-            self.db.commit()
-            if cursor.rowcount:
-                return True
-            return False
+            with contextlib.closing(self.db.cursor()) as cursor:
+                def execute():
+                    cursor.execute(
+                        "DELETE FROM tiles WHERE (zoom_level = ? AND last_modified < datetime(?, 'unixepoch', 'localtime'))",
+                        (level, timestamp))
+                    self.db.commit()
+                    if cursor.rowcount:
+                        return True
+                    return False
+                return self._retry_db(execute)
+        return False
 
     def load_tile_metadata(self, tile, dimensions=None):
         if not self.supports_timestamp:
