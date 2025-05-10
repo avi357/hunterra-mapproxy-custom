@@ -103,13 +103,14 @@ else:
 
     def _lock_file(file):
         try:
+            fcntl.lockf(file.fileno(), _flags)
             fcntl.flock(file.fileno(), _flags)
         except (IOError, OSError) as err:
             raise LockError("Couldn't lock {0}, error: {1}".format(file.name, err))
 
     def _unlock_file(file):
-        # File is automatically unlocked on close
-        pass
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        fcntl.lockf(file.fileno(), fcntl.LOCK_UN)
 
 
 class LockFile:
@@ -119,17 +120,8 @@ class LockFile:
     def __init__(self, path, file_permissions):
         self._path = path
         set_permissions = file_permissions and not os.path.exists(path)
-        try:
-            for attempt in range(10):
-                try:
-                    fp = open(path, 'w+')
-                    break
-                except IOError:
-                    if attempt == 9:  # Last attempt
-                        raise
-                    time.sleep(0.1)  # Wait 100ms between attempts
-        except IOError:
-            raise Exception('Could not create Lock-file, wrong permissions on lock directory?')
+
+        fp = open(path, 'w+', opener=self._opener)
 
         if set_permissions:
             permission = int(file_permissions, base=8)
@@ -148,6 +140,11 @@ class LockFile:
         fp.write(" %s\n" % os.getpid())
         fp.truncate()
         fp.flush()
+        os.fsync(fp.fileno())
+
+    def _opener(self, path, flags):
+        # Use O_SYNC for immediate writes
+        return os.open(path, flags | os.O_SYNC)
 
     def close(self):
         if self._fp is not None:
