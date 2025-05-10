@@ -16,6 +16,7 @@
 import glob
 import hashlib
 import os
+import random
 import threading
 import time
 from io import BytesIO
@@ -57,7 +58,6 @@ class MBTilesCache(TileCacheBase):
         self.ttl = with_timestamps and ttl or 0
         self.timeout = timeout
         self.wal = wal
-        self.ensure_mbtile()
         self._db_conn_cache = threading.local()
 
     @property
@@ -87,12 +87,14 @@ class MBTilesCache(TileCacheBase):
         self._db_conn_cache.db = None
 
     def ensure_mbtile(self):
-        if not os.path.exists(self.mbtile_file):
-            with FileLock(self.mbtile_file + '.init.lck', remove_on_unlock=REMOVE_ON_UNLOCK,
-                          directory_permissions=self.directory_permissions, file_permissions=self.file_permissions):
+        with FileLock(self.mbtile_file + '.init.lck', remove_on_unlock=REMOVE_ON_UNLOCK,
+                      directory_permissions=self.directory_permissions, file_permissions=self.file_permissions):
+            if not os.path.exists(self.mbtile_file):
+                time.sleep(random.uniform(0, 0.5))
                 if not os.path.exists(self.mbtile_file):
                     ensure_directory(self.mbtile_file, self.directory_permissions)
                     self._initialize_mbtile()
+                time.sleep(1)
 
     def _initialize_mbtile(self):
         log.info('initializing MBTile file %s', self.mbtile_file)
