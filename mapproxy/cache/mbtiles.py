@@ -91,40 +91,50 @@ class MBTilesCache(TileCacheBase):
         with FileLock(self.mbtile_file + '.init.lck', remove_on_unlock=REMOVE_ON_UNLOCK,
                       directory_permissions=self.directory_permissions, file_permissions=self.file_permissions):
             if not os.path.exists(self.mbtile_file):
-                time.sleep(random.uniform(0, 0.5))
+                time.sleep(random.uniform(0, 1))
                 if not os.path.exists(self.mbtile_file):
                     ensure_directory(self.mbtile_file, self.directory_permissions)
+                    with sqlite3.connect(self.mbtile_file, timeout=self.timeout) as db:
+                        db.commit()
                     self._initialize_mbtile()
-                time.sleep(1)
+                else:
+                    time.sleep(3)
 
     def _initialize_mbtile(self):
         log.info('initializing MBTile file %s', self.mbtile_file)
-        with sqlite3.connect(self.mbtile_file, timeout=self.timeout) as db:
-            stmt = """
-                CREATE TABLE tiles (
-                    zoom_level integer,
-                    tile_column integer,
-                    tile_row integer,
-                    tile_data blob
-            """
+        try:
+            with sqlite3.connect(self.mbtile_file, timeout=self.timeout) as db:
+                cursor = db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name='tiles'")
+                if cursor.fetchone():
+                    return
 
-            if self.supports_timestamp:
-                stmt += """
-                    , last_modified datetime DEFAULT (datetime('now','localtime'))
+                stmt = """
+                    CREATE TABLE tiles (
+                        zoom_level integer,
+                        tile_column integer,
+                        tile_row integer,
+                        tile_data blob
                 """
-            stmt += """
-                );
-            """
-            db.execute(stmt)
-
-            db.execute("""
-                CREATE TABLE metadata (name text, value text);
-            """)
-            db.execute("""
-                CREATE UNIQUE INDEX idx_tile on tiles
-                    (zoom_level, tile_column, tile_row);
-            """)
-            db.commit()
+    
+                if self.supports_timestamp:
+                    stmt += """
+                        , last_modified datetime DEFAULT (datetime('now','localtime'))
+                    """
+                stmt += """
+                    );
+                """
+                db.execute(stmt)
+    
+                db.execute("""
+                    CREATE TABLE metadata (name text, value text);
+                """)
+                db.execute("""
+                    CREATE UNIQUE INDEX idx_tile on tiles
+                        (zoom_level, tile_column, tile_row);
+                """)
+                db.commit()
+        except sqlite3.OperationalError as ex:
+            log.warning('unable to initialize MBTile file: %s', ex)
 
         if self.file_permissions:
             permission = int(self.file_permissions, base=8)
