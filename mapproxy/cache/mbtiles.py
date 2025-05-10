@@ -40,7 +40,12 @@ if not hasattr(glob, 'escape'):
 def sqlite_datetime_to_timestamp(datetime):
     if datetime is None:
         return None
-    d = time.strptime(datetime, "%Y-%m-%d %H:%M:%S")
+
+    if '.' in datetime:
+        d = time.strptime(datetime, "%Y-%m-%d %H:%M:%S.%f")
+    else:
+        d = time.strptime(datetime, "%Y-%m-%d %H:%M:%S")
+
     return time.mktime(d)
 
 
